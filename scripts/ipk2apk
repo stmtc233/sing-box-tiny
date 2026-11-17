@@ -1,0 +1,267 @@
+#!/bin/bash
+
+show_help() {
+    cat << EOF
+Usage: $(basename "$0") [OPTIONS] <FILE.ipk>... [OUTPUT_DIR]
+
+Arguments:
+  <FILE.ipk>...      One or more .ipk files to be converted.
+  [OUTPUT_DIR]       Target directory for .apk files (default: current dir).
+
+EOF
+}
+
+fix_version() {
+    local ver="$1"
+    local main_ver=""
+    local revision="0"
+
+    if [[ "$ver" =~ -r?([0-9]+)$ ]]; then
+        revision="${BASH_REMATCH[1]}"
+        main_ver="${ver%${BASH_REMATCH[0]}}"
+    else
+        main_ver="$ver"
+    fi
+
+    main_ver=$(echo "$main_ver" | sed 's/[^a-zA-Z0-9~._+]/./g')
+    main_ver=$(echo "$main_ver" | sed -E 's/\.+/./g; s/^\.+//; s/\.+$//')
+
+    [ -z "$main_ver" ] && main_ver="0"
+
+    echo "${main_ver}-r${revision}"
+}
+
+convert_one_ipk() {
+    local ipk_input="$1"
+    local output_dir="$2"
+
+    [ ! -f "$ipk_input" ] && { echo "Error: $ipk_input not found"; return 1; }
+
+    # setup paths and workspace
+    local abs_ipk=$(readlink -f "$ipk_input")
+    local abs_output_dir=$(readlink -f "$output_dir")
+    local tmp_dir=$(mktemp -d /tmp/ipk2apk.XXXXXX)
+    
+    echo "Processing: $(basename "$abs_ipk")"
+
+    pushd "$tmp_dir" > /dev/null || return 1
+
+    # unpack ipk
+    tar -xf "$abs_ipk" || { 
+        echo "Error: Failed to extract $(basename "$abs_ipk")"
+        popd > /dev/null; rm -rf "$tmp_dir"; return 1 
+    }
+
+    mkdir -p control_dir data_dir
+    [ -f "control.tar.gz" ] && tar -xzf control.tar.gz -C control_dir
+    [ -f "data.tar.gz" ] && tar -xzf data.tar.gz -C data_dir
+
+    local control_file="control_dir/control"
+    [ ! -f "$control_file" ] && { 
+        echo "Error: control metadata missing"; popd > /dev/null; rm -rf "$tmp_dir"; return 1 
+    }
+
+    # parse control fields
+    get_metadata() {
+        grep "^$1: " "$control_file" | cut -d' ' -f2-
+    }
+
+    local pkg_name=$(get_metadata "Package")
+    local raw_version=$(get_metadata "Version")
+    local pkg_version=$(fix_version "$raw_version")
+
+    local pkg_arch=$(get_metadata "Architecture")
+    [ "$pkg_arch" = "all" ] && pkg_arch="noarch"
+    local pkg_license=$(get_metadata "License")
+    local pkg_origin=$(get_metadata "Source")
+    local pkg_url=$(get_metadata "URL")
+    local pkg_maintainer=$(get_metadata "Maintainer")
+    local pkg_deps=$(get_metadata "Depends" | sed -e 's/ (//g' -e 's/)//g' -e 's/, */ /g')
+    local pkg_abi_version=$(get_metadata "ABIVersion")
+    local pkg_provides=$(get_metadata "Provides" | sed 's/, */ /g')
+    pkg_provides="$pkg_provides ${pkg_name%$pkg_abi_version}-any"
+    pkg_provides="${pkg_provides# }"
+    local pkg_require_user=$(get_metadata "Require-User")
+
+    local pkg_cpe_id=$(get_metadata "CPE-ID")
+    local pkg_alternatives=$(get_metadata "Alternatives" | sed 's/, */ /g')
+
+    local pkg_desc=$(sed -n '/^Description:/,/^[A-Z][a-zA-Z-]*:/p' "$control_file" \
+        | sed -e '1s/^Description: *//' -e '2,$ { /^[A-Z][a-zA-Z-]*:/d; s/^ //; s/^\.// }' \
+        | tr '\n' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//')
+    [ -z "$pkg_desc" ] && pkg_desc=$(get_metadata "Description")
+
+    # generate .list for apk package
+    local raw_list="$tmp_dir/files.list.txt"
+    pushd data_dir > /dev/null
+    (
+        find . -type f
+        find . -type l
+        find . -type d -empty
+    ) | sed 's|^\.||' | sed 's|/$||' | grep -v "^$" | sort -u > "$raw_list"
+    popd > /dev/null
+
+    local list_target_dir="data_dir/lib/apk/packages"
+    mkdir -p "$list_target_dir"
+    mv "$raw_list" "$list_target_dir/${pkg_name}.list"
+
+    if [ -n "$pkg_require_user" ]; then
+        echo "$pkg_require_user" > "$list_target_dir/${pkg_name}.rusers"
+    fi
+
+    if [ -n "$pkg_alternatives" ]; then
+        echo "$pkg_alternatives" > "$list_target_dir/${pkg_name}.alternatives"
+    fi
+
+    # process conffiles
+    if [ -f "control_dir/conffiles" ]; then
+        cp "control_dir/conffiles" "$list_target_dir/${pkg_name}.conffiles"
+        for cfile in $(cat "control_dir/conffiles"); do
+            local cfile_rel="${cfile#/}"
+            if [ -f "data_dir/$cfile_rel" ]; then
+                local csum=$(sha256sum "data_dir/$cfile_rel" | awk '{print $1}')
+                echo "$cfile $csum" >> "$list_target_dir/${pkg_name}.conffiles_static"
+            fi
+        done
+    fi
+
+    # maintenance scripts mapping
+    local script_args=""
+    add_script() {
+        if [ -f "$2" ]; then
+            chmod +x "$2"
+            script_args="$script_args --script $1:$(readlink -f "$2")"
+        fi
+    }
+
+    # post-install
+    local post_install_script="$tmp_dir/post-install"
+    cat <<EOF > "$post_install_script"
+#!/bin/sh
+[ "\${IPKG_NO_SCRIPT}" = "1" ] && exit 0
+[ -s \${IPKG_INSTROOT}/lib/functions.sh ] || exit 0
+. \${IPKG_INSTROOT}/lib/functions.sh
+export root="\${IPKG_INSTROOT}"
+export pkgname="$pkg_name"
+add_group_and_user
+default_postinst
+EOF
+    if [ -f "control_dir/postinst-pkg" ]; then
+        sed '/^\s*#!/d' "control_dir/postinst-pkg" >> "$post_install_script"
+    elif [ -f "control_dir/postinst" ] && ! grep -q "default_postinst" "control_dir/postinst"; then
+        sed '/^\s*#!/d' "control_dir/postinst" >> "$post_install_script"
+    fi
+    add_script "post-install" "$post_install_script"
+
+    # pre-upgrade (and pre-install)
+    if [ -f "control_dir/preinst" ]; then
+        local pre_upgrade_script="$tmp_dir/pre-upgrade"
+        echo "#!/bin/sh" > "$pre_upgrade_script"
+        echo "export PKG_UPGRADE=1" >> "$pre_upgrade_script"
+        sed '/^\s*#!/d' "control_dir/preinst" >> "$pre_upgrade_script"
+        add_script "pre-upgrade" "$pre_upgrade_script"
+        add_script "pre-install" "control_dir/preinst"
+    fi
+
+    # post-upgrade
+    local post_upgrade_script="$tmp_dir/post-upgrade"
+    echo "#!/bin/sh" > "$post_upgrade_script"
+    echo "export PKG_UPGRADE=1" >> "$post_upgrade_script"
+    sed '/^\s*#!/d' "$post_install_script" >> "$post_upgrade_script"
+    add_script "post-upgrade" "$post_upgrade_script"
+
+    # pre-deinstall
+    local pre_deinstall_script="$tmp_dir/pre-deinstall"
+    cat <<EOF > "$pre_deinstall_script"
+#!/bin/sh
+[ "\${IPKG_NO_SCRIPT}" = "1" ] && exit 0
+[ -s \${IPKG_INSTROOT}/lib/functions.sh ] || exit 0
+. \${IPKG_INSTROOT}/lib/functions.sh
+export root="\${IPKG_INSTROOT}"
+export pkgname="$pkg_name"
+default_prerm
+EOF
+    if [ -f "control_dir/prerm-pkg" ]; then
+        sed '/^\s*#!/d' "control_dir/prerm-pkg" >> "$pre_deinstall_script"
+    elif [ -f "control_dir/prerm" ] && ! grep -q "default_prerm" "control_dir/prerm"; then
+        sed '/^\s*#!/d' "control_dir/prerm" >> "$pre_deinstall_script"
+    fi
+    add_script "pre-deinstall" "$pre_deinstall_script"
+
+    # post-deinstall
+    if [ -f "control_dir/postrm" ]; then
+        sed -zi 's/^\s*#!/#!/' "control_dir/postrm" 2>/dev/null || true
+        add_script "post-deinstall" "control_dir/postrm"
+    fi
+
+    # run apk mkpkg
+    local output_apk="${abs_output_dir}/${pkg_name}-${pkg_version}.apk"
+
+    local extra_args=()
+    if [ -n "$pkg_abi_version" ]; then
+        extra_args+=(--info "tags:openwrt:abiversion=$pkg_abi_version")
+    fi
+
+    if [ -n "$pkg_cpe_id" ]; then
+        extra_args+=(--info "tags:openwrt:cpe=$pkg_cpe_id")
+    fi
+
+    fakeroot apk mkpkg \
+        --info "name:$pkg_name" \
+        --info "version:$pkg_version" \
+        --info "description:$pkg_desc" \
+        --info "arch:$pkg_arch" \
+        --info "license:$pkg_license" \
+        --info "origin:$pkg_origin" \
+        --info "url:$pkg_url" \
+        --info "maintainer:$pkg_maintainer" \
+        --info "provides:$pkg_provides" \
+        --info "depends:$pkg_deps" \
+        "${extra_args[@]}" \
+        $script_args \
+        --files "$(readlink -f data_dir)" \
+        --output "$output_apk"
+
+    popd > /dev/null
+    rm -rf "$tmp_dir"
+    
+    [ -f "$output_apk" ] && echo "Done: $(basename "$output_apk")" || echo "Error: Failed to build $pkg_name"
+}
+
+script_dir() {
+	local src="$0"
+	if [[ "$src" == */* ]]; then
+		:
+	else
+		src="$(which "$src")"
+		[ -z "$src" ] && { echo "Error: $src not found in PATH" >&2; exit 1; }
+	fi
+	echo "$(dirname "$(readlink -f "$src")")"
+}
+
+fallback_to_docker_if_needed() {
+	[ -z "$(which apk)" -o -z "$(which fakeroot)" ] || return 0
+	echo "apk or fakeroot command not found in PATH, fallback to docker"
+	local docker_fake_root="$(readlink -f "$(script_dir)/../docker")"
+	"$docker_fake_root/init.sh" "$1" || { echo "docker fallback path failed!"; exit 1; }
+	export PATH="$docker_fake_root/bin:$PATH"
+}
+
+[ "$#" -eq 0 ] && { show_help; exit 0; }
+
+if [ "$#" -eq 1 ]; then
+    fallback_to_docker_if_needed "$(pwd)"
+    convert_one_ipk "$1" "$(pwd)"
+elif [ "$#" -eq 2 ] && [[ "$1" == *.ipk ]] && [[ ! "$2" == *.ipk ]]; then
+    fallback_to_docker_if_needed "$2"
+    convert_one_ipk "$1" "$2"
+else
+    fallback_to_docker_if_needed "$(pwd)"
+    for file in "$@"; do
+        if [[ "$file" == *.ipk ]]; then
+            convert_one_ipk "$file" "$(pwd)"
+        else
+            echo "Skip: $file (not an ipk)"
+        fi
+    done
+fi

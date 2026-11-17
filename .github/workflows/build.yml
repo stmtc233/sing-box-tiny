@@ -1,0 +1,210 @@
+name: Build and Release sing-box tiny (IPK & APK)
+
+on:
+  schedule:
+    # 每天 UTC 03:00 (北京时间 11:00) 自动检查上游是否有新版本
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      custom_tag:
+        description: '指定 sing-box 源码标签 (留空则自动检测最新稳定版, 如 v1.14.4)'
+        required: false
+        type: string
+        default: ''
+      force_build:
+        description: '强制重新编译 (即使该 Release 已存在)'
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'scripts/**'
+      - 'files/**'
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Check latest version
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ github.event.inputs.custom_tag }}" ]; then
+            TAG="${{ github.event.inputs.custom_tag }}"
+          else
+            TAG=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+          fi
+
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # 检查当前仓库是否已有此 Release
+          EXISTS="false"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            EXISTS="true"
+          fi
+
+          if [ "$EXISTS" = "false" ] || [ "${{ github.event.inputs.force_build }}" = "true" ] || [ "${{ github.event_name }}" = "push" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "需要构建并发布版本: $TAG"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "版本 $TAG 已存在，跳过构建。"
+          fi
+
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: 'x86_64'
+            goarch: 'amd64'
+            tags: 'with_clash_api,with_quic,with_utls,with_wireguard,with_gvisor'
+          - arch: 'aarch64_cortex-a53'
+            goarch: 'arm64'
+            tags: 'with_clash_api,with_quic,with_utls,with_wireguard,with_gvisor'
+          - arch: 'aarch64_generic'
+            goarch: 'arm64'
+            tags: 'with_clash_api,with_quic,with_utls,with_wireguard,with_gvisor'
+          - arch: 'arm_cortex-a7_neon-vfpv4'
+            goarch: 'arm'
+            goarm: '7'
+            tags: 'with_clash_api,with_quic,with_utls,with_wireguard,with_gvisor'
+          - arch: 'mipsel_24kc'
+            goarch: 'mipsle'
+            gomips: 'softfloat'
+            tags: 'with_clash_api,with_quic,with_utls'
+          - arch: 'mips_24kc'
+            goarch: 'mips'
+            gomips: 'softfloat'
+            tags: 'with_clash_api,with_quic,with_utls'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Setup packaging tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y fakeroot
+          sudo curl -fsSL https://github.com/sbwml/apk-tools/releases/download/v3.0.5-static/apk.static-x86_64 -o /usr/local/bin/apk
+          sudo chmod +x /usr/local/bin/apk
+          apk --version
+
+      - name: Clone sing-box source
+        run: |
+          git clone --depth 1 --branch "${{ needs.check-version.outputs.tag }}" https://github.com/SagerNet/sing-box.git source-tree
+
+      - name: Compile sing-box (${{ matrix.arch }})
+        env:
+          CGO_ENABLED: '0'
+          GOOS: 'linux'
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+        run: |
+          mkdir -p bin
+          cd source-tree
+          go build -v -trimpath \
+            -ldflags="-s -w -buildid= -X github.com/sagernet/sing-box/constant.Version=${{ needs.check-version.outputs.version }}" \
+            -tags "${{ matrix.tags }}" \
+            -o ../bin/sing-box ./cmd/sing-box
+          cd ..
+          ls -lh bin/sing-box
+
+      - name: Package IPK and APK
+        run: |
+          ./scripts/build-pkg.sh "${{ matrix.arch }}" bin/sing-box "${{ needs.check-version.outputs.version }}" 1 dist
+          ls -la dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: dist/*
+
+  release:
+    needs: [check-version, build]
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Generate Checksums
+        run: |
+          cd dist
+          sha256sum * > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-version.outputs.tag }}
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          # 如果已存在同名 Release 则先删除重建
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+
+          NOTES=$(cat <<EOF
+          ## sing-box-tiny $TAG 自动构建发布
+
+          基于上游 [SagerNet/sing-box](https://github.com/SagerNet/sing-box) **$TAG** 源码编译。
+          专为 OpenWrt / ImmortalWrt 路由器打造的 **Tiny 精简版** 安装包，剥离 ACME、Embedded Tor、Tailscale 等重型特性，仅保留核心代理和网络穿透协议，大幅降低体积与内存占用。
+
+          ### 📦 安装包类型说明
+          - **.ipk**: 适用于 OpenWrt 23.05 及更旧版本（\`opkg\` 包管理器）
+          - **.apk**: 适用于 OpenWrt 24.10、25.12+ 等现代版本（\`apk-tools\` 包管理器）
+
+          ### 📱 常见芯片架构支持
+          - \`x86_64\`: 软路由 / 虚拟机 / PVE / ESXi
+          - \`aarch64_cortex-a53\`: MediaTek MT7981 / MT7986 (红米 AX6000 / 360T7 / S20P 等)
+          - \`aarch64_generic\`: 通用 64 位 ARM (RK3399 / RK3568 / 树莓派等)
+          - \`arm_cortex-a7_neon-vfpv4\`: 32 位 ARM (IPQ4019 / IPQ806x 等)
+          - \`mipsel_24kc\`: MediaTek MT7621 (K2P / 红米 AC2100 / Newifi D2 等)
+          - \`mips_24kc\`: Atheros / Qualcomm MIPS 架构
+
+          ### 🚀 路由器安装命令
+
+          **OpenWrt 24.10 / 25.x (APK):**
+          \`\`\`bash
+          apk add --allow-untrusted ./sing-box-tiny_${VERSION}-r1_<arch>.apk
+          \`\`\`
+
+          **OpenWrt 23.05 / 旧版 (IPK):**
+          \`\`\`bash
+          opkg update
+          opkg install ./sing-box-tiny_${VERSION}-1_<arch>.ipk
+          \`\`\`
+          EOF
+          )
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "sing-box-tiny $TAG" \
+            --notes "$NOTES" \
+            dist/*

@@ -1,0 +1,6 @@
+bin/
+dist/
+source-tree/
+*.ipk
+*.apk
+.DS_Store
